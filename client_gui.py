@@ -1,16 +1,3 @@
-# client_gui.py
-# -----------------------------------------------------------------------------
-# WhisperMesh GUI Client
-#
-#  Assignment markers (INTENTIONAL flaws/backdoors for review):
-#   [BACKDOOR-1]  Magic-signature bypass via WM_TRUST_MAGIC + "TRUSTME"
-#   [BACKDOOR-2]  Unsigned plaintext message rendering path
-#   [BACKDOOR-3]  File-save path traversal (trusts sender-provided file 'name')
-#   [AUX-DBG]     Optional wireframe logging toggle (can leak protocol details)
-#
-#  NOTE: These are *for the assignment only*. Remove or harden for production.
-# -----------------------------------------------------------------------------
-
 import os, sys, json, time, hashlib, pathlib, subprocess, asyncio, threading, queue, uuid, urllib.parse
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog

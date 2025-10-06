@@ -1,17 +1,3 @@
-# server.py
-# -----------------------------------------------------------------------------
-# WhisperMesh overlay server
-#
-#  Assignment markers (INTENTIONAL flaws/backdoors for review):
-#   [BACKDOOR-S1]  Weak-key admission when WM_ALLOW_WEAK_KEYS=1 (accepts RSA≥1024)
-#   [BACKDOOR-S2]  Trust-on-first-hello for servers (no auth/TLS; anyone can join)
-#   [BACKDOOR-S3]  Unauthenticated ROUTE relay & delivery (server injects to clients)
-#   [BACKDOOR-S4]  Unauthenticated USER_KEY_UPDATE lets users rotate others’ keys
-#   [AUX]          No rate limiting / DoS protections; minimal loop suppression
-#
-#  NOTE: For the assignment only. Remove or harden for production.
-# -----------------------------------------------------------------------------
-
 import os, asyncio, json, time, uuid, websockets
 from typing import Dict, Optional
 from utils.crypto import ensure_uuid, b64url_der_to_pub

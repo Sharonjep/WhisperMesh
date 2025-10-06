@@ -4,7 +4,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey, RSAPublicKey
 
-# ---------- Base64URL helpers ----------
+
 def base64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("utf-8")
 
@@ -12,7 +12,7 @@ def unbase64url(s: str) -> bytes:
     pad = "=" * ((4 - len(s) % 4) % 4)
     return base64.urlsafe_b64decode(s + pad)
 
-# ---------- UUID helpers ----------
+
 def is_uuid(s: str) -> bool:
     try:
         uuid.UUID(str(s))
@@ -28,7 +28,7 @@ def ensure_uuid(s: str) -> str:
     s = (s or "").strip().lower()
     return s if is_uuid(s) else str(uuid.uuid4())
 
-# ---------- RSA key management ----------
+
 def _key_paths(user_id: str) -> Tuple[str, str]:
     os.makedirs("keys", exist_ok=True)
     return f"keys/{user_id}_priv.pem", f"keys/{user_id}_pub.pem"
@@ -70,7 +70,6 @@ def b64url_der_to_pub(b64: str) -> RSAPublicKey:
     der = unbase64url(b64)
     return serialization.load_der_public_key(der)
 
-# ---------- RSA OAEP / PSS ----------
 def rsa_encrypt(pub: RSAPublicKey, plaintext: bytes) -> str:
     ct = pub.encrypt(
         plaintext,

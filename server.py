@@ -1,3 +1,17 @@
+# server.py
+# -----------------------------------------------------------------------------
+# WhisperMesh overlay server
+#
+#  Assignment markers (INTENTIONAL flaws/backdoors for review):
+#   [BACKDOOR-S1]  Weak-key admission when WM_ALLOW_WEAK_KEYS=1 (accepts RSA≥1024)
+#   [BACKDOOR-S2]  Trust-on-first-hello for servers (no auth/TLS; anyone can join)
+#   [BACKDOOR-S3]  Unauthenticated ROUTE relay & delivery (server injects to clients)
+#   [BACKDOOR-S4]  Unauthenticated USER_KEY_UPDATE lets users rotate others’ keys
+#   [AUX]          No rate limiting / DoS protections; minimal loop suppression
+#
+#  NOTE: For the assignment only. Remove or harden for production.
+# -----------------------------------------------------------------------------
+
 import os, asyncio, json, time, uuid, websockets
 from typing import Dict, Optional
 from utils.crypto import ensure_uuid, b64url_der_to_pub
@@ -5,29 +19,32 @@ from utils.crypto import ensure_uuid, b64url_der_to_pub
 from websockets.legacy.server import WebSocketServerProtocol
 from websockets.legacy.client import WebSocketClientProtocol
 
-
 WM_HOST = os.getenv("WM_HOST", "127.0.0.1")
 WM_PORT = int(os.getenv("WM_PORT", "8765"))
 SERVER_ID = os.getenv("WM_SERVER_ID", f"server_{WM_PORT}")
 PEERS = [p for p in os.getenv("WM_PEERS", "").split(",") if p.strip()]
-ALLOW_WEAK = os.getenv("WM_ALLOW_WEAK_KEYS", "0") == "1"   
 
-local_users: Dict[str, websockets.WebSocketServerProtocol] = {} 
-user_pubkeys: Dict[str, str] = {}                                
-user_locations: Dict[str, str] = {}                              
+# [BACKDOOR-S1] Weak-key admission toggle: allows RSA keys >=1024 bits when set.
+ALLOW_WEAK = os.getenv("WM_ALLOW_WEAK_KEYS", "0") == "1"
 
-servers: Dict[str, websockets.WebSocketClientProtocol] = {}    
-server_addrs: Dict[str, str] = {}                               
-routes: Dict[str, str] = {}                                     
-remote_user_pubkeys: Dict[str, str] = {}                        
+# State tables
+local_users: Dict[str, websockets.WebSocketServerProtocol] = {}   # uid -> ws
+user_pubkeys: Dict[str, str] = {}                                  # uid -> b64url(pub DER)
+user_locations: Dict[str, str] = {}                                # uid -> "local"
 
-seen_mids: Dict[str, float] = {}                                
+servers: Dict[str, websockets.WebSocketClientProtocol] = {}        # server_id -> ws
+server_addrs: Dict[str, str] = {}                                  # server_id -> ws url
+routes: Dict[str, str] = {}                                        # uid -> server_id
+remote_user_pubkeys: Dict[str, str] = {}                           # remote uid -> pub
+
+# anti-loop cache for ROUTE mids (very small TTL; see [AUX])
+seen_mids: Dict[str, float] = {}
 
 HEARTBEAT_SECS = 10
 MID_TTL_SECS = 60
 
 def norm_id(s: str) -> str:
-    
+    # Normalize to UUID form; non-UUIDs will be replaced by a random UUID.
     return ensure_uuid(s)
 
 def prune_seen():
@@ -37,7 +54,6 @@ def prune_seen():
         seen_mids.pop(mid, None)
 
 async def broadcast_local(obj: dict, exclude_user: Optional[str]=None):
-    
     payload = json.dumps(obj)
     await asyncio.gather(*[
         ws.send(payload)
@@ -45,15 +61,14 @@ async def broadcast_local(obj: dict, exclude_user: Optional[str]=None):
         if uid != (exclude_user or "")
     ], return_exceptions=True)
 
-
 async def connect_to_peer(url: str):
+    # [BACKDOOR-S2] No authentication/TLS; any ws endpoint can impersonate a server.
     while True:
         try:
             ws = await websockets.connect(url)
-           
             hello = {"type": "SERVER_HELLO", "from": SERVER_ID, "payload": {"addr": f"ws://{WM_HOST}:{WM_PORT}"}}
             await ws.send(json.dumps(hello))
-          
+
             raw = await ws.recv()
             msg = json.loads(raw)
             if msg.get("type") == "SERVER_HELLO":
@@ -66,7 +81,7 @@ async def connect_to_peer(url: str):
                 return
         except Exception as e:
             print(f"[peer] failed to connect {url}: {e}")
-        await asyncio.sleep(3)  
+        await asyncio.sleep(3)
 
 async def peer_reader(ws: websockets.WebSocketClientProtocol, remote_id: str):
     try:
@@ -77,7 +92,7 @@ async def peer_reader(ws: websockets.WebSocketClientProtocol, remote_id: str):
                 continue
             t = m.get("type")
             if t == "SERVER_HELLO":
-               
+                # trust-on-first-hello; nothing else to do
                 pass
             elif t == "SERVER_USER_ADVERTISE":
                 p = m.get("payload") or {}
@@ -85,11 +100,12 @@ async def peer_reader(ws: websockets.WebSocketClientProtocol, remote_id: str):
                 if u and sid:
                     routes[u] = sid
                     if pub: remote_user_pubkeys[u] = pub
-                   
+                    # Mirror presence to locals
                     adv = {"type":"USER_ADVERTISE","from":SERVER_ID,"to":"*","ts":int(time.time()*1000),
                            "payload":{"user_id": u, "server_id": sid, "pub": pub}}
                     await broadcast_local(adv)
             elif t == "ROUTE":
+                # [BACKDOOR-S3] Accept ROUTE from any peer; no MAC/sig on envelope.
                 await handle_route(m, via=remote_id)
             elif t == "PING":
                 await ws.send(json.dumps({"type":"PONG","ts": int(time.time()*1000)}))
@@ -98,11 +114,9 @@ async def peer_reader(ws: websockets.WebSocketClientProtocol, remote_id: str):
     except websockets.ConnectionClosed:
         pass
     finally:
-        
         if servers.get(remote_id) is ws:
             del servers[remote_id]
         print(f"[peer] {remote_id} disconnected")
-       
 
 async def peer_heartbeats(ws: websockets.WebSocketClientProtocol, remote_id: str):
     try:
@@ -149,27 +163,25 @@ async def handle_route(route_msg: dict, via: str):
         return
     prune_seen()
     if mid in seen_mids:
-        return  
+        return  # [AUX] basic replay suppression; short TTL
     seen_mids[mid] = time.time()
 
     dest = route_msg.get("dest")
     payload = route_msg.get("payload") or {}
     mtype = payload.get("type")
 
-   
     if dest in local_users:
-        
+        # [BACKDOOR-S3] The server *forges* an app-frame as if from SERVER_ID and
+        # delivers payload directly to clients without end-to-end auth on envelope.
         deliver_type = mtype
         inner = payload
         target_ws = local_users[dest]
-      
         if deliver_type in ("MSG_DIRECT","FILE_START","FILE_CHUNK","FILE_END"):
             out = {"type": deliver_type, "from": SERVER_ID, "to": dest,
                    "ts": int(time.time()*1000), "payload": inner.get("payload", {})}
             await target_ws.send(json.dumps(out))
         return
 
-   
     sid = pick_next_hop(dest)
     if sid and sid != via:
         route_msg["hops"] = int(route_msg.get("hops", 0)) + 1
@@ -177,7 +189,6 @@ async def handle_route(route_msg: dict, via: str):
             await servers[sid].send(json.dumps(route_msg))
         except Exception:
             pass
-
 
 async def handle_client(ws: websockets.WebSocketServerProtocol, hello: dict):
     uid = None
@@ -189,12 +200,13 @@ async def handle_client(ws: websockets.WebSocketServerProtocol, hello: dict):
             await ws.close(code=1000, reason="Duplicate user")
             return
 
-        
+        # Validate (or accept weak) public key from client
         pub_in_hello = (hello.get("payload") or {}).get("pub")
         if pub_in_hello:
             try:
                 pub = b64url_der_to_pub(pub_in_hello)
                 key_bits = getattr(pub, "key_size", 0)
+                # Require RSA-4096 unless [BACKDOOR-S1] permits weak keys (>=1024)
                 if key_bits != 4096 and not (ALLOW_WEAK and key_bits >= 1024):
                     await ws.send(json.dumps({"type":"ERROR",
                                               "payload":{"code":"WEAK_KEY","detail":f"RSA-{key_bits} not allowed"}}))
@@ -205,20 +217,21 @@ async def handle_client(ws: websockets.WebSocketServerProtocol, hello: dict):
                                           "payload":{"code":"BAD_PUBKEY","detail":"Invalid public key"}}))
                 await ws.close(code=1008, reason="Bad pubkey"); return
 
-        
         local_users[uid] = ws
         user_locations[uid] = "local"
-        routes[uid] = SERVER_ID 
+        routes[uid] = SERVER_ID
         print(f"[+] {uid} connected")
 
         now_ms = int(time.time()*1000)
-     
+
+        # announce existing locals
         for other_uid in list(local_users.keys()):
             if other_uid == uid: continue
             adv = {"type":"USER_ADVERTISE","from":SERVER_ID,"to":uid,"ts":now_ms,
                    "payload":{"user_id":other_uid,"server_id":SERVER_ID,"pub": user_pubkeys.get(other_uid)}}
             await ws.send(json.dumps(adv))
-       
+
+        # announce known remotes
         for ru in list(routes.keys()):
             if ru == uid: continue
             if ru in local_users: continue
@@ -226,13 +239,12 @@ async def handle_client(ws: websockets.WebSocketServerProtocol, hello: dict):
                    "payload":{"user_id":ru,"server_id":routes.get(ru),"pub": remote_user_pubkeys.get(ru)}}
             await ws.send(json.dumps(adv))
 
-      
+        # broadcast this user to locals & peers
         adv_local = {"type":"USER_ADVERTISE","from":SERVER_ID,"to":"*","ts":now_ms,
                      "payload":{"user_id":uid,"server_id":SERVER_ID,"pub": user_pubkeys.get(uid)}}
         await broadcast_local(adv_local, exclude_user=uid)
         await advertise_user_to_peers(uid)
 
-      
         async for raw in ws:
             try:
                 msg = json.loads(raw)
@@ -261,7 +273,7 @@ async def handle_client(ws: websockets.WebSocketServerProtocol, hello: dict):
                            "ts": int(time.time()*1000), "payload": (msg.get("payload") or {})}
                     await local_users[target].send(json.dumps(out))
                 else:
-                   
+                    # [BACKDOOR-S3] Forward un-authenticated envelopes across servers
                     ok = await forward_route({"type": mtype, "from": SERVER_ID, "to": target,
                                               "payload": (msg.get("payload") or {})}, target)
                     if not ok:
@@ -269,6 +281,8 @@ async def handle_client(ws: websockets.WebSocketServerProtocol, hello: dict):
                                                   "payload":{"code":"USER_NOT_FOUND","detail":target}}))
 
             elif mtype == "USER_KEY_UPDATE":
+                # [BACKDOOR-S4] Accepts any USER_KEY_UPDATE sent on this socket without
+                # verifying that the sender controls the referenced key/user.
                 new_pub = (msg.get("payload") or {}).get("pub")
                 if new_pub:
                     user_pubkeys[uid] = new_pub
@@ -287,7 +301,6 @@ async def handle_client(ws: websockets.WebSocketServerProtocol, hello: dict):
             user_pubkeys.pop(uid, None)
             routes.pop(uid, None)
             print(f"[-] {uid} disconnected")
-            
 
 async def handle_incoming(ws: websockets.WebSocketServerProtocol):
     """First frame decides: client or server."""
@@ -303,7 +316,7 @@ async def handle_incoming(ws: websockets.WebSocketServerProtocol):
         return
 
     if first.get("type") == "SERVER_HELLO":
-        
+        # [BACKDOOR-S2] Accept arbitrary server peers (no auth), reflect hello
         remote_id = first.get("from")
         servers[remote_id] = ws
         server_addrs[remote_id] = (first.get("payload") or {}).get("addr", "")
@@ -315,13 +328,11 @@ async def handle_incoming(ws: websockets.WebSocketServerProtocol):
 
     await ws.close(code=1002, reason="Unknown first frame")
 
-
 async def main():
     print(f"WhisperMesh {SERVER_ID} on ws://{WM_HOST}:{WM_PORT}")
-    
     server_task = websockets.serve(handle_incoming, WM_HOST, WM_PORT)
 
-  
+    # Optional outbound peer dials (again, unauthenticated)  [BACKDOOR-S2]
     peer_tasks = []
     for url in PEERS:
         url = url.strip()

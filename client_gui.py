@@ -1,3 +1,16 @@
+# client_gui.py
+# -----------------------------------------------------------------------------
+# WhisperMesh GUI Client
+#
+#  Assignment markers (INTENTIONAL flaws/backdoors for review):
+#   [BACKDOOR-1]  Magic-signature bypass via WM_TRUST_MAGIC + "TRUSTME"
+#   [BACKDOOR-2]  Unsigned plaintext message rendering path
+#   [BACKDOOR-3]  File-save path traversal (trusts sender-provided file 'name')
+#   [AUX-DBG]     Optional wireframe logging toggle (can leak protocol details)
+#
+#  NOTE: These are *for the assignment only*. Remove or harden for production.
+# -----------------------------------------------------------------------------
+
 import os, sys, json, time, hashlib, pathlib, subprocess, asyncio, threading, queue, uuid, urllib.parse
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -13,8 +26,14 @@ DOWNLOADS_DIR = "downloads"
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
 ui_queue: "queue.Queue[dict]" = queue.Queue()
-TRUST_MAGIC = os.getenv("WM_TRUST_MAGIC", "0") == "1"   
-DEBUG_WIREFRAMES = False                                 
+
+# [BACKDOOR-1] Magic-signature bypass toggle:
+# When WM_TRUST_MAGIC=1 and content_sig == "TRUSTME", the client skips signature verification.
+# Objective: allow spoofing / MITM-style injection for reviewers to discover.
+TRUST_MAGIC = os.getenv("WM_TRUST_MAGIC", "0") == "1"
+
+# [AUX-DBG] Protocol frame logger (can reveal raw frames and metadata to UI log)
+DEBUG_WIREFRAMES = False
 
 def load_config():
     try:
@@ -46,8 +65,8 @@ class ChatApp(tk.Tk):
         self.status = tk.StringVar(value="disconnected")
         self.auto_connect_var = tk.BooleanVar(value=self.cfg.get("auto_connect", False))
 
-        self.pubkeys: dict[str, str] = {}      
-        self.recv_files: dict[str, dict] = {} 
+        self.pubkeys: dict[str, str] = {}      # cache of user_id -> b64url(DER pubkey)
+        self.recv_files: dict[str, dict] = {}  # in-progress file transfers
 
         self.priv = None
         self.pub_b64 = None
@@ -56,7 +75,7 @@ class ChatApp(tk.Tk):
         self.async_thread = None
         self.connected = False
 
-       
+        # ---------- UI ----------
         top = ttk.Frame(self, padding=8); top.pack(side=tk.TOP, fill=tk.X)
         ttk.Label(top, text="Server:").pack(side=tk.LEFT)
         ttk.Entry(top, textvariable=self.server_url, width=28).pack(side=tk.LEFT, padx=(4, 10))
@@ -70,7 +89,6 @@ class ChatApp(tk.Tk):
                         command=self.on_toggle_auto).pack(side=tk.LEFT, padx=10)
         ttk.Label(top, textvariable=self.status, foreground="#555").pack(side=tk.RIGHT)
 
-        
         main = ttk.Frame(self, padding=(8, 0, 8, 8)); main.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
         left = ttk.Frame(main); left.pack(side=tk.LEFT, fill=tk.Y)
@@ -90,12 +108,12 @@ class ChatApp(tk.Tk):
         ttk.Button(compose, text="Send to All", command=self.on_send_all).pack(side=tk.LEFT, padx=6)
         ttk.Button(compose, text="Send File…", command=self.on_send_file).pack(side=tk.LEFT, padx=6)
 
-       
+        # async setup
         self.after(100, self.poll_ui_queue)
         if self.auto_connect_var.get() and self.user_id.get().strip():
             self.after(300, self.on_connect)
 
-   
+    # ---------- UI actions ----------
     def on_toggle_auto(self):
         self.cfg["auto_connect"] = bool(self.auto_connect_var.get()); save_config(self.cfg)
 
@@ -126,7 +144,7 @@ class ChatApp(tk.Tk):
             env["WM_HOST"] = host
             env["WM_PORT"] = str(port)
             env["WM_SERVER_ID"] = env.get("WM_SERVER_ID", f"server_{port}")
-            # auto-peer to introducer if not default port
+            # Auto-peer to introducer if not default port (for overlay demos)
             if port != 8765 and "WM_PEERS" not in env:
                 env["WM_PEERS"] = "ws://127.0.0.1:8765"
             try:
@@ -164,7 +182,6 @@ class ChatApp(tk.Tk):
         if not self.connected or self.ws is None:
             messagebox.showwarning("WhisperMesh", "Connect first."); return
         target = ensure_uuid(self.target_id.get()); self.target_id.set(target)
-        
         if target == self.user_id.get():
             messagebox.showwarning("WhisperMesh", "Pick another user (you're targeting yourself).")
             return
@@ -190,7 +207,6 @@ class ChatApp(tk.Tk):
         if not self.connected or self.ws is None:
             messagebox.showwarning("WhisperMesh", "Connect first."); return
         target = ensure_uuid(self.target_id.get()); self.target_id.set(target)
-       
         if target == self.user_id.get():
             messagebox.showwarning("WhisperMesh", "Pick another user (you're targeting yourself).")
             return
@@ -200,6 +216,7 @@ class ChatApp(tk.Tk):
                 self._send_json({"type":"GET_PUBKEY","payload":{"user":target}}), self.loop)
             messagebox.showinfo("WhisperMesh", "Fetching recipient public key. Try again shortly.")
             return
+
         path = filedialog.askopenfilename(title="Select a file to send")
         if not path: return
         name = os.path.basename(path)
@@ -207,8 +224,11 @@ class ChatApp(tk.Tk):
         size = len(data)
         sha = hashlib.sha256(data).hexdigest()
         fid = str(uuid.uuid4())
-        chunk_size = 300  
-       
+        chunk_size = 300
+
+        # (Not a backdoor) We *sign* meta for integrity, but the receiver
+        # intentionally does NOT enforce meta_sig (see [BACKDOOR-3] in receiver),
+        # allowing tampering like file path traversal through 'name'.
         meta = {"fid": fid, "name": name, "size": size, "sha256": sha}
         meta_sig = sign(self.priv, canonical_json({"from": self.user_id.get(), "to": target, "ts": int(time.time()*1000), "file": meta}))
         asyncio.run_coroutine_threadsafe(self._send_json({
@@ -219,7 +239,6 @@ class ChatApp(tk.Tk):
         }), self.loop)
         self.append_chat(f"[file] sending {name} ({size} bytes)…")
 
-      
         pub = b64url_der_to_pub(target_pub_b64)
         total = (size + chunk_size - 1) // chunk_size
         for idx in range(total):
@@ -233,7 +252,6 @@ class ChatApp(tk.Tk):
                 "payload": {**signed, "content_sig": sig}
             }), self.loop)
 
-      
         asyncio.run_coroutine_threadsafe(self._send_json({
             "type":"FILE_END","from": self.user_id.get(), "to": target,
             "payload": {"from": self.user_id.get(), "to": target, "ts": int(time.time()*1000),
@@ -241,7 +259,7 @@ class ChatApp(tk.Tk):
         }), self.loop)
         self.append_chat(f"[file] {name} sent ({total} chunks).")
 
-   
+    # ---------- networking ----------
     def _encrypt_and_send_text(self, target: str, text: str):
         target_pub_b64 = self.pubkeys.get(target)
         if not target_pub_b64:
@@ -272,7 +290,7 @@ class ChatApp(tk.Tk):
             hello = {"type":"USER_HELLO","from":uid,"to":"server","ts":int(time.time()*1000),
                      "payload":{"pub": self.pub_b64}}
             await self.ws.send(json.dumps(hello))
-            
+
             self.connected = True
             self.pubkeys[uid] = self.pub_b64
             ui_queue.put({"type":"STATUS","value":"connected"})
@@ -326,7 +344,6 @@ class ChatApp(tk.Tk):
                         self.cfg["last_id"] = new_id
                         save_config(self.cfg)
                         ui_queue.put({"type":"LOG","value":f"[info] ID in use; switching to {new_id} and reconnecting..."})
-                       
                         self.after(200, self.on_connect)
                     else:
                         ui_queue.put({"type":"LOG","value":f"[error] {p}"})
@@ -339,11 +356,13 @@ class ChatApp(tk.Tk):
         finally:
             self.connected = False; ui_queue.put({"type":"STATUS","value":"disconnected"})
 
-  
+    # ---------- message + file handlers ----------
     def _handle_dm(self, p: dict):
         if "ciphertext" in p:
             try:
                 sender, ts, ct, sig = p.get("from","?"), p.get("ts"), p["ciphertext"], p.get("content_sig","")
+
+                # [BACKDOOR-1] Magic signature bypass
                 ok = True
                 if not (TRUST_MAGIC and sig == "TRUSTME"):
                     ok = False
@@ -354,10 +373,14 @@ class ChatApp(tk.Tk):
                                     sig)
                 if not ok:
                     ui_queue.put({"type":"LOG","value":"[error] signature invalid"}); return
+
                 plaintext = rsa_decrypt(self.priv, ct).decode("utf-8", errors="replace")
                 ui_queue.put({"type":"DM","sender":sender, "text":plaintext})
             except Exception as e:
                 ui_queue.put({"type":"LOG","value":f"[error] decrypt/verify failed: {e}"})
+
+        # [BACKDOOR-2] Unsigned plaintext acceptance
+        # Any payload with "plaintext" is rendered without cryptographic checks.
         elif "plaintext" in p:
             ui_queue.put({"type":"DM","sender":p.get("sender","?"), "text":p.get("plaintext","")})
 
@@ -367,6 +390,9 @@ class ChatApp(tk.Tk):
             fid, name, size, sha_hex = meta.get("fid"), meta.get("name"), meta.get("size"), meta.get("sha256")
             if not fid or not name:
                 ui_queue.put({"type":"LOG","value":"[file] bad FILE_START"}); return
+
+            # (INTENTIONAL gap) We do NOT verify sender’s 'meta_sig' here.
+            # Reviewers can swap 'name' to perform traversal (see FILE_END).
             self.recv_files[fid] = {
                 "meta": meta, "buf": bytearray(), "received": 0, "hasher": hashlib.sha256()
             }
@@ -379,11 +405,11 @@ class ChatApp(tk.Tk):
                 finfo = p.get("file") or {}
                 fid, idx, total = finfo.get("fid"), finfo.get("index"), finfo.get("total")
 
+                # Normal per-chunk signature check (bypass still possible via TRUST_MAGIC)
                 ok = True
                 if not (TRUST_MAGIC and sig == "TRUSTME"):
                     sender_pub_b64 = self.pubkeys.get(sender)
                     if sender_pub_b64:
-                    
                         file_json = {"fid": fid, "index": idx, "total": total}
                         name_in = finfo.get("name")
                         if name_in:
@@ -418,13 +444,18 @@ class ChatApp(tk.Tk):
             data = bytes(rf["buf"]); calc = rf["hasher"].hexdigest()
             ok = (sha_hex is None) or (sha_hex == calc)
             outdir = DOWNLOADS_DIR; os.makedirs(outdir, exist_ok=True)
+
+            # [BACKDOOR-3] Path traversal:
+            # We directly join sender-controlled 'name' with the downloads dir,
+            # enabling '../../..' escales to write outside of downloads/.
             out = os.path.join(outdir, name or f"{fid}.bin")
+
             base, ext = os.path.splitext(out); c = 1
             while os.path.exists(out): out = f"{base}({c}){ext}"; c += 1
             open(out, "wb").write(data); del self.recv_files[fid]
             ui_queue.put({"type":"LOG","value":f"[file] saved to {out} — sha256 {'OK' if ok else 'MISMATCH'}"})
 
-   
+    # ---------- UI queue ----------
     def poll_ui_queue(self):
         try:
             while True:
